@@ -1,0 +1,150 @@
+# @configure_input@
+
+srcdir := @abs_top_srcdir@
+builddir := @abs_top_builddir@
+prefix := @prefix@
+
+LLVM_SRCDIR := @llvm_srcdir@
+NEWLIB_SRCDIR := @newlib_srcdir@
+
+WITH_ARCH ?= @arch@
+WITH_ABI ?= @abi@
+
+SHELL := /bin/sh
+CMAKE ?= @CMAKE@
+
+XLEN := $(patsubst rv32%,32,$(patsubst rv64%,64,$(WITH_ARCH)))
+
+make_tuple = riscv$(1)-unknown-$(2)
+NEWLIB_TUPLE := $(call make_tuple,$(XLEN),elf)
+
+CC_FOR_TARGET ?= $(prefix)/bin/clang
+CXX_FOR_TARGET ?= $(prefix)/bin/clang++
+AS_FOR_TARGET ?= $(prefix)/bin/llvm-as
+AR_FOR_TARGET ?= $(prefix)/bin/llvm-ar
+RANLIB_FOR_TARGET ?= $(prefix)/bin/llvm-ranlib
+READELF_FOR_TARGET ?= $(prefix)/bin/llvm-readelf
+LLVM_CONFIG_PATH ?= $(prefix)/bin/llvm-config
+
+CFLAGS_FOR_TARGET := -march=$(WITH_ARCH) -mabi=$(WITH_ABI) -mcmodel=@cmodel@
+CXXFLAGS_FOR_TARGET := $(CFLAGS_FOR_TARGET)
+
+.PHONY: llvm
+llvm: stamps/build-llvm
+
+stamps/build-llvm: $(LLVM_SRCDIR)
+	mkdir -p $(notdir $@)
+	$(CMAKE) \
+		-DLLVM_ENABLE_PROJECTS='clang;lld' \
+		-DLLVM_TARGETS_TO_BUILD='RISCV' \
+		-DLLVM_DEFAULT_TARGET_TRIPLE='$(NEWLIB_TUPLE)' \
+		-DLLVM_ENABLE_TERMINFO=OFF \
+		-DLLVM_ENABLE_ASSERTIONS=ON \
+		-DLLVM_ENABLE_EH=ON \
+		-DLLVM_ENABLE_RTTI=ON \
+		-DCLANG_DEFAULT_LINKER=lld \
+		-DCMAKE_BUILD_TYPE=Release \
+		-S $</llvm -B $(notdir $@)
+	$(CMAKE) --build $(notdir $@) -j 8
+	$(CMAKE) --install $(notdir $@) --prefix $(prefix)
+	mkdir -p $(dir $@) && touch $@
+
+.PHONY: compiler-rt
+compiler-rt: stamps/build-compiler-rt
+
+# NOTE: CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY is needed to avoid
+# CMake compiler checks failing when a binary cannot be linked yet
+
+stamps/build-compiler-rt: $(LLVM_SRCDIR) stamps/build-llvm
+	mkdir -p $(notdir $@)
+	$(CMAKE) -Wno-dev \
+		-DCOMPILER_RT_BUILD_BUILTINS=ON \
+		-DCOMPILER_RT_BUILD_CRT=ON \
+		-DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+		-DCOMPILER_RT_BUILD_XRAY=OFF \
+		-DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+		-DCOMPILER_RT_BUILD_PROFILE=OFF \
+		-DCOMPILER_RT_BUILD_MEMPROF=OFF \
+		-DCOMPILER_RT_BUILD_ORC=OFF \
+		-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+		-DCOMPILER_RT_BAREMETAL_BUILD=ON \
+		-DCOMPILER_RT_OS_DIR='' \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+		-DCMAKE_C_COMPILER='$(CC_FOR_TARGET)' \
+		-DCMAKE_CXX_COMPILER='$(CXX_FOR_TARGET)' \
+		-DCMAKE_AR='$(AR_FOR_TARGET)' \
+		-DCMAKE_RANLIB='$(RANLIB_FOR_TARGET)' \
+		-DCMAKE_C_COMPILER_TARGET='$(NEWLIB_TUPLE)' \
+		-DCMAKE_CXX_COMPILER_TARGET='$(NEWLIB_TUPLE)' \
+		-DCMAKE_ASM_COMPILER_TARGET='$(NEWLIB_TUPLE)' \
+		-DCMAKE_C_FLAGS_INIT='$(CFLAGS_FOR_TARGET)' \
+		-DCMAKE_CXX_FLAGS_INIT='$(CXXFLAGS_FOR_TARGET)' \
+		-DLLVM_CONFIG_PATH='$(LLVM_CONFIG_PATH)' \
+		-S $</compiler-rt -B $(notdir $@)
+	$(CMAKE) --build $(notdir $@)
+	$(CMAKE) --install $(notdir $@) --prefix "$$($(prefix)/bin/clang --print-resource-dir)"
+	mkdir -p $(dir $@) && touch $@
+
+
+.PHONY: newlib
+newlib: stamps/build-newlib
+
+NEWLIB_CFLAGS := \
+	-target $(NEWLIB_TUPLE) \
+	-g -O2 -std=gnu90 \
+	-mno-relax -Wno-error=int-conversion \
+	-ffunction-sections -fdata-sections
+
+NEWLIB_NANO := @newlib_nano@
+
+ifneq ($(NEWLIB_NANO),)
+NEWLIB_CONFIGURE_ARGS := \
+	--enable-newlib-reent-small \
+	--disable-newlib-fvwrite-in-streamio \
+	--disable-newlib-fseek-optimization \
+	--disable-newlib-wide-orient \
+	--enable-newlib-nano-malloc \
+	--disable-newlib-unbuf-stream-opt \
+	--enable-lite-exit \
+	--enable-newlib-global-atexit \
+	--enable-newlib-nano-formatted-io \
+	--disable-newlib-supplied-syscalls \
+	--disable-nls
+else
+NEWLIB_CONFIGURE_ARGS := \
+	--enable-newlib-io-long-double \
+	--enable-newlib-io-long-long \
+	--enable-newlib-io-c99-formats \
+	--enable-newlib-register-fini
+
+NEWLIB_CFLAGS += -D_POSIX_MODE
+endif
+
+stamps/build-newlib: $(NEWLIB_SRCDIR) stamps/build-llvm
+	mkdir -p $(notdir $@)
+	cd $(notdir $@) && \
+		CC_FOR_TARGET='$(CC_FOR_TARGET)' \
+		AS_FOR_TARGET='$(AS_FOR_TARGET)' \
+		AR_FOR_TARGET='$(AR_FOR_TARGET)' \
+		RANLIB_FOR_TARGET='$(RANLIB_FOR_TARGET)' \
+		READELF_FOR_TARGET='$(READELF_FOR_TARGET)' \
+		CFLAGS_FOR_TARGET='$(NEWLIB_CFLAGS) $(CFLAGS_FOR_TARGET)' \
+		CXXFLAGS_FOR_TARGET='$(NEWLIB_CFLAGS) $(CXXFLAGS_FOR_TARGET)' \
+		$</configure --prefix=$(prefix) \
+			--target=$(NEWLIB_TUPLE) \
+			$(NEWLIB_CONFIGURE_ARGS)
+	$(MAKE) -C $(notdir $@)
+	$(MAKE) -C $(notdir $@) install
+	mkdir -p $(dir $@) && touch $@
+
+
+.PHONY: clean clean-llvm clean-compiler-rt clean-newlib
+clean-llvm clean-compiler-rt clean-newlib: clean-%:
+	rm -rf stamps/build-$* build-$*
+
+clean: clean-llvm clean-compiler-rt clean-newlib
+
+# Disable built-in suffix rules
+.SUFFIXES:
